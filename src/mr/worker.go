@@ -92,7 +92,7 @@ func performMapTask(mapf func(string, string) []KeyValue, filename string, mapID
 
 func performReduceTask(reducef func(string, []string) string, reduceID int) {
 	var kvarr []KeyValue
-	
+
 	files, _ := os.ReadDir(".")
 	for _, file := range files {
 		var mapID int
@@ -113,7 +113,12 @@ func performReduceTask(reducef func(string, []string) string, reduceID int) {
 	}
 
 	sort.Sort(ByKey(kvarr))
-	tempFile, _ := ioutil.TempFile("", "mr-out-tmp-*")
+
+	// Use a temporary file for atomic write
+	tempFile, err := os.CreateTemp("", "mr-out-tmp-*")
+	if err != nil {
+		log.Fatalf("cannot create temp file for reduce output: %v", err)
+	}
 
 	i := 0
 	for i < len(kvarr) {
@@ -132,6 +137,7 @@ func performReduceTask(reducef func(string, []string) string, reduceID int) {
 
 	tempFile.Close()
 	outFile := fmt.Sprintf("mr-out-%d", reduceID)
+	// Atomically rename the temporary file to the final output file
 	os.Rename(tempFile.Name(), outFile)
 }
 
@@ -139,8 +145,8 @@ func performReduceTask(reducef func(string, []string) string, reduceID int) {
 func reportTaskCompletion(taskType TaskType, taskId int, success bool) {
 	args := TaskReportArgs{
 		TaskType: taskType,
-		TaskID: taskId,
-		Success: success,
+		TaskID:   taskId,
+		Success:  success,
 	}
 	reply := TaskReportReply{}
 	call("Master.ReportTask", &args, &reply)
