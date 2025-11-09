@@ -306,17 +306,18 @@ func randomizedElectionTimeout() time.Duration {
 }
 
 // Must be called with lock held.
+// Update the commit index if there exists an N such that N > commitIndex,
 func (rf *Raft) updateCommitIndex() {
 	lastLogIndex := len(rf.log) - 1
-	for N := lastLogIndex; N > rf.commitedIndex; N-- {
-		if rf.log[N].Term == rf.currentTerm {
+	for N := lastLogIndex; N > rf.commitedIndex; N-- { // Check from last log index of leader down to current commit index + 1
+		if rf.log[N].Term == rf.currentTerm { // Only consider entries from current term
 			count := 1 // Count self
-			for i := range rf.peers {
+			for i := range rf.peers { 
 				if i != rf.me && rf.matchIndex[i] >= N {
 					count++
 				}
 			}
-			if count > len(rf.peers)/2 {
+			if count > len(rf.peers)/2 { // Majority of servers have replicated this entry
 				rf.commitedIndex = N
 				rf.applyCond.Signal() // Wake up applier
 				break
@@ -340,6 +341,7 @@ func (rf *Raft) replicateLogToPeer(server int) {
 	}
 	prevLogTerm := rf.log[prevLogIndex].Term // Term of peer's prevLogIndex entry
 	entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+	// This will be empty for heartbeat; may send more than one for efficiency	
 	copy(entries, rf.log[prevLogIndex+1:])
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -399,6 +401,7 @@ func (rf *Raft) replicateLogToPeer(server int) {
 	}
 }
 
+// Broadcast AppendEntries RPCs to all peers.
 func (rf *Raft) broadcastAppendEntries() {
 	for i := range rf.peers {
 		if i == rf.me {
@@ -408,7 +411,7 @@ func (rf *Raft) broadcastAppendEntries() {
 	}
 }
 
-// In raft.go, add this new function
+// Heartbeat loop that sends periodic heartbeats to follower peers.
 func (rf *Raft) heartbeatLoop() {
 	heartbeatInterval := 100 * time.Millisecond
 	timer := time.NewTimer(heartbeatInterval)
@@ -548,35 +551,37 @@ func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesRe
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm { // Reply false if leader's term < peer's currentTerm
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.currentTerm { // If RPC term is higher, convert to follower
 		rf.becomeFollower(args.Term)
-	} else {
-		rf.state = Follower
+	} else { 
+		rf.state = Follower // Reset to follower on receiving AppendEntries with same term
 	}
+
+	// Reset election time: this is done on receiving valid AppendEntries RPC no matter what
+	// Prevents unnecessary elections on network delays or partitions
 	rf.electionTimer.Reset(randomizedElectionTimeout())
 
 	reply.Term = rf.currentTerm
 
 	lastLogIndex := len(rf.log) - 1
-	if args.PrevLogIndex > lastLogIndex {
-		// Follower's log is too short
+	if args.PrevLogIndex > lastLogIndex { // Follower's log is too short
 		reply.Success = false
 		reply.ConflictIndex = lastLogIndex + 1
 		reply.ConflictTerm = -1 // No conflicting term
 		return
 	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // Follower's log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 		reply.Success = false
 		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 		// Find the first index of the conflicting term
 		firstIndexOfTerm := 1
-		for i := args.PrevLogIndex; i > 0; i-- {
+		for i := args.PrevLogIndex; i > 0; i-- { // Iterate backwards to find first index of ConflictTerm
 			if rf.log[i-1].Term != reply.ConflictTerm {
 				firstIndexOfTerm = i
 				break
@@ -587,12 +592,12 @@ func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesRe
 	}
 
 	for i, entry := range args.Entries {
-		logIndex := args.PrevLogIndex + 1 + i
-		if logIndex > len(rf.log)-1 {
-			rf.log = append(rf.log, args.Entries[i:]...)
-			break
+		logIndex := args.PrevLogIndex + 1 + i // Calculate the index in the log for this entry
+		if logIndex > len(rf.log)-1 { // Append any new entries not already in the log
+			rf.log = append(rf.log, args.Entries[i:]...) 
+			break // Breaks once all the entires are appended
 		}
-		if rf.log[logIndex].Term != entry.Term {
+		if rf.log[logIndex].Term != entry.Term { // If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
 			rf.log = rf.log[:logIndex]
 			rf.log = append(rf.log, args.Entries[i:]...)
 			break
@@ -601,11 +606,14 @@ func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesRe
 
 	reply.Success = true
 
-	// Update commit index
+	// Update commit index of follower if LeaderCommit > peer's commitIndex
+	// The follower's commit index update code runs on the SECOND AppendEntries RPC as the first one might not have any entries
+	// First RPC: Carries the new log entries + OLD LeaderCommit
+	// Second RPC: Carries NEW LeaderCommit (after leader committed)
 	if args.LeaderCommit > rf.commitedIndex {
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
 		rf.commitedIndex = min(args.LeaderCommit, lastNewEntryIndex)
-		rf.applyCond.Signal()
+		rf.applyCond.Signal() // Wake up applier
 	}
 }
 
@@ -689,33 +697,38 @@ func (rf *Raft) killed() bool {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
+	lastindex := -1
 	term := -1
 	isLeader := true
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.state != Leader {
+	// If not leader, return false
+	if rf.state != Leader { 
 		isLeader = false
-		return index, term, isLeader
+		return lastindex, term, isLeader
 	}
 
+	// Create a new log entry
 	newEntry := LogEntry{
 		Term:    rf.currentTerm,
 		Command: command,
 	}
 
+	// Append the new entry to the log
 	rf.log = append(rf.log, newEntry)
 
 	rf.persist()
 
-	index = len(rf.log) - 1
+	// Return the index and term of the new entry
+	lastindex = len(rf.log) - 1
 	term = rf.currentTerm
 
+	// Start log replication to followers
 	rf.broadcastAppendEntries()
 
-	return index, term, isLeader
+	return lastindex, term, isLeader
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -748,7 +761,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
 
-	// initialize from state persisted before a crash
+	// Initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.lastAppliedIndex = rf.commitedIndex

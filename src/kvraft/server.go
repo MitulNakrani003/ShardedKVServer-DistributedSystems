@@ -177,6 +177,7 @@ func (kv *KVServer) applier() {
 				}
 				kv.ackedRequests[op.ClientId] = op.RequestId
 			}
+
 			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
 				kv.takeSnapshot(msg.CommandIndex)
 			}
@@ -191,7 +192,6 @@ func (kv *KVServer) applier() {
 }
 
 func (kv *KVServer) takeSnapshot(lastAppliedIndextoDB int) {
-	// Take a snapshot of the current state
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.database)
