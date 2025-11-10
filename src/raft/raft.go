@@ -312,7 +312,7 @@ func (rf *Raft) updateCommitIndex() {
 	for N := lastLogIndex; N > rf.commitedIndex; N-- { // Check from last log index of leader down to current commit index + 1
 		if rf.log[N].Term == rf.currentTerm { // Only consider entries from current term
 			count := 1 // Count self
-			for i := range rf.peers { 
+			for i := range rf.peers {
 				if i != rf.me && rf.matchIndex[i] >= N {
 					count++
 				}
@@ -325,7 +325,6 @@ func (rf *Raft) updateCommitIndex() {
 		}
 	}
 }
-
 
 func (rf *Raft) replicateLogToPeer(server int) {
 	rf.mu.Lock()
@@ -341,7 +340,7 @@ func (rf *Raft) replicateLogToPeer(server int) {
 	}
 	prevLogTerm := rf.log[prevLogIndex].Term // Term of peer's prevLogIndex entry
 	entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
-	// This will be empty for heartbeat; may send more than one for efficiency	
+	// This will be empty for heartbeat; may send more than one for efficiency
 	copy(entries, rf.log[prevLogIndex+1:])
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -467,7 +466,7 @@ func (rf *Raft) SaveSnapshot(index int, snapshot []byte) {
 }
 
 //=====================================================================================================================================
-// ROUTINES 
+// ROUTINES
 //=====================================================================================================================================
 
 // Goroutine that applies committed log entries to the state machine.
@@ -559,7 +558,7 @@ func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesRe
 
 	if args.Term > rf.currentTerm { // If RPC term is higher, convert to follower
 		rf.becomeFollower(args.Term)
-	} else { 
+	} else {
 		rf.state = Follower // Reset to follower on receiving AppendEntries with same term
 	}
 
@@ -593,8 +592,8 @@ func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesRe
 
 	for i, entry := range args.Entries {
 		logIndex := args.PrevLogIndex + 1 + i // Calculate the index in the log for this entry
-		if logIndex > len(rf.log)-1 { // Append any new entries not already in the log
-			rf.log = append(rf.log, args.Entries[i:]...) 
+		if logIndex > len(rf.log)-1 {         // Append any new entries not already in the log
+			rf.log = append(rf.log, args.Entries[i:]...)
 			break // Breaks once all the entires are appended
 		}
 		if rf.log[logIndex].Term != entry.Term { // If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
@@ -617,10 +616,13 @@ func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesRe
 	}
 }
 
+func (rf *Raft) InstallSnapshotRPC(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	DPrintf("InstallSnapshotRPC Called")
+}
+
 //=====================================================================================================================================
 // RPC SENDERS
 //=====================================================================================================================================
-
 
 // sendRequestVote is already provided, but you call it like this.
 // It's a wrapper around rf.peers[server].Call("Raft.RequestVote", args, reply)
@@ -658,6 +660,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntriesRPC", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshotRPC", args, reply)
 	return ok
 }
 
@@ -705,7 +712,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	// If not leader, return false
-	if rf.state != Leader { 
+	if rf.state != Leader {
 		isLeader = false
 		return lastindex, term, isLeader
 	}

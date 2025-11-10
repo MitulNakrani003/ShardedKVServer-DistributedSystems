@@ -21,6 +21,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+//=====================================================================================================================================
+// STRUCTS
+//=====================================================================================================================================
+
 type Op struct {
 	Operation string
 	Key       string
@@ -41,7 +45,13 @@ type KVServer struct {
 	database      map[string]string // key-value store
 	ackedRequests map[int64]int64   // clientId -> lastRequestId
 	resultCh      map[int]chan Op   // log index -> chan to notify waiting RPC handler
+
+	lastAppliedToDB int // last applied log index to the database
 }
+
+//=====================================================================================================================================
+// GET AND PUTAPPEND HANDLER
+//=====================================================================================================================================
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := Op{
@@ -66,30 +76,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case resultOp := <-ch:
 		if resultOp.ClientId == op.ClientId && resultOp.RequestId == op.RequestId {
-			kv.mu.Lock()
-			value, ok := kv.database[op.Key]
-			kv.mu.Unlock()
-			if ok {
-				reply.Err = OK
-				reply.Value = value
-			} else {
-				reply.Err = ErrNoKey
-			}
+			reply.Err = OK
+			reply.Value = resultOp.Value
 		} else {
 			reply.Err = ErrWrongLeader
 		}
 		DPrintf("Check Returned Response: resultOp.ClientId=%v, resultOp.RequestId=%v, op.ClientId=%v, op.RequestId=%v", resultOp.ClientId, resultOp.RequestId, op.ClientId, op.RequestId)
-		// Clean up the channel after successful completion
-		kv.mu.Lock()
-		delete(kv.resultCh, index)
-		kv.mu.Unlock()
+
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrWrongLeader
-		// Clean up the channel on timeout to prevent deadlock
-		kv.mu.Lock()
-		delete(kv.resultCh, index)
-		kv.mu.Unlock()
 	}
+
+	kv.mu.Lock()
+	delete(kv.resultCh, index)
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -120,21 +120,82 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ErrWrongLeader
 		}
 		DPrintf("Check Returned Response: resultOp.ClientId=%v, resultOp.RequestId=%v, op.ClientId=%v, op.RequestId=%v", resultOp.ClientId, resultOp.RequestId, op.ClientId, op.RequestId)
-		// Clean up the channel on timeout to prevent deadlock
-		// Very important to prevent memory leak
-		// Stuck Here for 3 Hours to solve deadlock problem
-		kv.mu.Lock()
-		delete(kv.resultCh, index)
-		kv.mu.Unlock()
+
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrWrongLeader
-		// Clean up the channel on timeout to prevent deadlock
-		// Very important to prevent memory leak
-		kv.mu.Lock()
-		delete(kv.resultCh, index)
-		kv.mu.Unlock()
+	}
+
+	kv.mu.Lock()
+	delete(kv.resultCh, index)
+	kv.mu.Unlock()
+}
+
+//=====================================================================================================================================
+// APPLIER ROUTINE
+//=====================================================================================================================================
+
+// It blindly executes the operations in the exact sequence it receives them from Raft.
+// It also handles duplicate detection
+func (kv *KVServer) applier() {
+	for msg := range kv.applyCh {
+		if kv.killed() {
+			return
+		}
+
+		if msg.CommandValid {
+			op := msg.Command.(Op) // Cast the command to an Op struct
+			kv.mu.Lock()
+			if msg.CommandIndex <= kv.lastAppliedToDB {
+				kv.mu.Unlock()
+				continue // Skip already applied commands
+			}
+
+			// Duplicate detection
+			lastRequestId, ok := kv.ackedRequests[op.ClientId]
+			if !ok || op.RequestId > lastRequestId { // If this is a new request or a higher request ID
+				switch op.Operation { // Only PUT and APPEND here to make seperation in concerns for database access
+				case "Put": // Additional GET condition here can create a bottleneck of the applier function just to read DB and can make raft slow
+					kv.database[op.Key] = op.Value
+				case "Append":
+					kv.database[op.Key] += op.Value
+				}
+				kv.ackedRequests[op.ClientId] = op.RequestId
+			}
+			if op.Operation == "Get" {
+				op.Value = kv.database[op.Key]
+			}
+
+			// Update last applied index
+			kv.lastAppliedToDB = msg.CommandIndex
+
+			ch, ok := kv.resultCh[msg.CommandIndex]
+			kv.mu.Unlock()
+			if ok {
+				ch <- op
+			}
+		}
+		kv.checkAndTakeSnapshot()
 	}
 }
+
+func (kv *KVServer) checkAndTakeSnapshot() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.database)
+		e.Encode(kv.ackedRequests)
+		data := w.Bytes()
+		kv.rf.SaveSnapshot(kv.lastAppliedToDB, data)
+	}
+
+}
+
+//=====================================================================================================================================
+// KILL AND START SERVER
+//=====================================================================================================================================
 
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
@@ -153,51 +214,6 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
-}
-
-// It blindly executes the operations in the exact sequence it receives them from Raft.
-// It also handles duplicate detection
-func (kv *KVServer) applier() {
-	for msg := range kv.applyCh {
-		if kv.killed() {
-			return
-		}
-
-		if msg.CommandValid {
-			op := msg.Command.(Op) // Cast the command to an Op struct
-			kv.mu.Lock()
-
-			lastRequestId, ok := kv.ackedRequests[op.ClientId]
-			if !ok || op.RequestId > lastRequestId { // If this is a new request or a higher request ID
-				switch op.Operation { // Only PUT and APPEND here to make seperation in concerns for database access
-				case "Put": // Additional GET condition here can create a bottleneck of the applier function just to read DB and can make raft slow 
-					kv.database[op.Key] = op.Value
-				case "Append":
-					kv.database[op.Key] += op.Value
-				}
-				kv.ackedRequests[op.ClientId] = op.RequestId
-			}
-
-			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
-				kv.takeSnapshot(msg.CommandIndex)
-			}
-
-			ch, ok := kv.resultCh[msg.CommandIndex]
-			kv.mu.Unlock()
-			if ok {
-				ch <- op
-			}
-		}
-	}
-}
-
-func (kv *KVServer) takeSnapshot(lastAppliedIndextoDB int) {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(kv.database)
-	e.Encode(kv.ackedRequests)
-	data := w.Bytes()
-	kv.rf.SaveSnapshot(lastAppliedIndextoDB, data)
 }
 
 // servers[] contains the ports of the set of
@@ -226,6 +242,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.resultCh = make(map[int]chan Op)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.lastAppliedToDB = 0
 
 	go kv.applier()
 	return kv
