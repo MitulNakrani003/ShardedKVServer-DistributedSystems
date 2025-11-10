@@ -173,7 +173,15 @@ func (kv *KVServer) applier() {
 			if ok {
 				ch <- op
 			}
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+				kv.readSnapshot(msg.Snapshot)
+				kv.lastAppliedToDB = msg.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		}
+		// Check if snapshot is needed
 		kv.checkAndTakeSnapshot()
 	}
 }
@@ -190,7 +198,24 @@ func (kv *KVServer) checkAndTakeSnapshot() {
 		data := w.Bytes()
 		kv.rf.SaveSnapshot(kv.lastAppliedToDB, data)
 	}
+}
 
+// This is used both on startup and when receiving a snapshot from Raft.
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	// The lock is already held by the caller
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var db map[string]string
+	var ack map[int64]int64
+	if d.Decode(&db) != nil || d.Decode(&ack) != nil {
+		log.Fatalf("KVServer %d failed to read snapshot", kv.me)
+	} else {
+		kv.database = db
+		kv.ackedRequests = ack
+	}
 }
 
 //=====================================================================================================================================
@@ -243,6 +268,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.lastAppliedToDB = 0
+
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		kv.readSnapshot(snapshot)
+		// The lastAppliedToDB will be correctly set when Raft sends the snapshot
+		// via applyCh upon startup, or we can get it from Raft's state.
+		// For simplicity, we let the applier handle it.
+	}
 
 	go kv.applier()
 	return kv
