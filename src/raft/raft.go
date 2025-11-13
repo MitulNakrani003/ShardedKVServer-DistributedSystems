@@ -364,10 +364,9 @@ func (rf *Raft) replicateLogToPeer(server int) {
 	}
 
 	// Building the Append Entries Arguments
-	prevLogIndex := rf.nextIndex[server] - 1         // Index of peer's log entry immediately preceding new ones
+	prevLogIndex := rf.nextIndex[server] - 1 // Index of peer's log entry immediately before new ones
 	prevLogTerm := rf.getLogEntry(prevLogIndex).Term // Term of peer's prevLogIndex entry
 	entries := make([]LogEntry, rf.getMyLastLogIndex()-prevLogIndex)
-	// This will be empty for heartbeat; may send more than one for efficiency
 	copy(entries, rf.log[rf.getLocalIndex(prevLogIndex+1):])
 
 	args := AppendEntriesArgs{
@@ -482,7 +481,7 @@ func (rf *Raft) SaveSnapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 	rf.log = newLog
 
-	// Adjust commit and applied indices if they are now part of the snapshot
+	// Update commit and applied indices
 	if rf.commitedIndex < index {
 		rf.commitedIndex = index
 	}
@@ -537,7 +536,7 @@ func (rf *Raft) sendSnapshotToPeer(server int) {
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+func (rf *Raft) ConditionToInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -550,7 +549,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 		// Snapshot is ahead of our log, replace our log entirely
 		rf.log = make([]LogEntry, 1)
 	} else {
-		// Truncate our log
+		// Truncate our log and keep entries after lastIncludedIndex
 		newLog := make([]LogEntry, 1)
 		newLog = append(newLog, rf.log[rf.getLocalIndex(lastIncludedIndex+1):]...)
 		rf.log = newLog
@@ -568,7 +567,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 		rf.lastAppliedIndex = lastIncludedIndex
 	}
 
-	// Persist the new state and snapshot
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)

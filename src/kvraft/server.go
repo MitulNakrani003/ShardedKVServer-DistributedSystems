@@ -153,8 +153,8 @@ func (kv *KVServer) applier() {
 			// Duplicate detection
 			lastRequestId, ok := kv.ackedRequests[op.ClientId]
 			if !ok || op.RequestId > lastRequestId { // If this is a new request or a higher request ID
-				switch op.Operation { // Only PUT and APPEND here to make seperation in concerns for database access
-				case "Put": // Additional GET condition here can create a bottleneck of the applier function just to read DB and can make raft slow
+				switch op.Operation {
+				case "Put": 
 					kv.database[op.Key] = op.Value
 				case "Append":
 					kv.database[op.Key] += op.Value
@@ -175,13 +175,12 @@ func (kv *KVServer) applier() {
 			}
 		} else if msg.SnapshotValid {
 			kv.mu.Lock()
-			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+			if kv.rf.ConditionToInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
 				kv.readSnapshot(msg.Snapshot)
 				kv.lastAppliedToDB = msg.SnapshotIndex
 			}
 			kv.mu.Unlock()
 		}
-		// Check if snapshot is needed
 		kv.checkAndTakeSnapshot()
 	}
 }
@@ -200,10 +199,9 @@ func (kv *KVServer) checkAndTakeSnapshot() {
 	}
 }
 
-// This is used both on startup and when receiving a snapshot from Raft.
 func (kv *KVServer) readSnapshot(snapshot []byte) {
-	// The lock is already held by the caller
-	if snapshot == nil || len(snapshot) < 1 {
+	// The lock is already held
+	if len(snapshot) < 1 {
 		return
 	}
 	r := bytes.NewBuffer(snapshot)
@@ -270,11 +268,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastAppliedToDB = 0
 
 	snapshot := persister.ReadSnapshot()
-	if len(snapshot) > 0 {
+	if len(snapshot) > 0 { // bootstrap from snapshot check if any exists
 		kv.readSnapshot(snapshot)
-		// The lastAppliedToDB will be correctly set when Raft sends the snapshot
-		// via applyCh upon startup, or we can get it from Raft's state.
-		// For simplicity, we let the applier handle it.
 	}
 
 	go kv.applier()
