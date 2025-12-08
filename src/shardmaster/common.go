@@ -34,8 +34,16 @@ const (
 
 type Err string
 
+//------------------------------------------------------------------------------
+// RPC arguments and replies
+//------------------------------------------------------------------------------
+// JOIN
+
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers map[int][]string // new GID -> servers mapping
+
+	ClientId int64
+	RequestId int64
 }
 
 type JoinReply struct {
@@ -43,8 +51,13 @@ type JoinReply struct {
 	Err         Err
 }
 
+// LEAVE
+
 type LeaveArgs struct {
 	GIDs []int
+
+	ClientId int64
+	RequestId int64
 }
 
 type LeaveReply struct {
@@ -52,9 +65,14 @@ type LeaveReply struct {
 	Err         Err
 }
 
+
+// MOVE
 type MoveArgs struct {
 	Shard int
 	GID   int
+	
+	ClientId int64
+	RequestId int64
 }
 
 type MoveReply struct {
@@ -62,8 +80,13 @@ type MoveReply struct {
 	Err         Err
 }
 
+// QUERY
+
 type QueryArgs struct {
 	Num int // desired config number
+
+	ClientId int64
+	RequestId int64
 }
 
 type QueryReply struct {

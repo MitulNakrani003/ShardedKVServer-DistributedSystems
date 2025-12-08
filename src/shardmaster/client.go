@@ -4,14 +4,21 @@ package shardmaster
 // Shardmaster clerk.
 //
 
-import "../labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync"
+	"time"
+
+	"../labrpc"
+)
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// Your data here.
+	servers       []*labrpc.ClientEnd
+	mu            sync.Mutex
+	smLeaderId    int
+	clientId      int64
+	currRequestId int64
 }
 
 func nrand() int64 {
@@ -24,14 +31,27 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// Your code here.
+	ck.smLeaderId = 0
+	ck.clientId = nrand()
+	ck.currRequestId = 0
 	return ck
 }
+
+//------------------------------------------------------------------------------
+// RPC calls
+//------------------------------------------------------------------------------
 
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
+	ck.mu.Lock()
 	args.Num = num
+	args.ClientId = ck.clientId
+	args.RequestId = ck.currRequestId
+	ck.currRequestId++
+	ck.mu.Unlock()
+
+	// Can save leaderID for shardmaster and use that to make RPC calls to server.
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -48,7 +68,12 @@ func (ck *Clerk) Query(num int) Config {
 func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
+	ck.mu.Lock()
 	args.Servers = servers
+	args.ClientId = ck.clientId
+	args.RequestId = ck.currRequestId
+	ck.currRequestId++
+	ck.mu.Unlock()
 
 	for {
 		// try each known server.
@@ -66,7 +91,12 @@ func (ck *Clerk) Join(servers map[int][]string) {
 func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
+	ck.mu.Lock()
 	args.GIDs = gids
+	args.ClientId = ck.clientId
+	args.RequestId = ck.currRequestId
+	ck.currRequestId++
+	ck.mu.Unlock()
 
 	for {
 		// try each known server.
@@ -84,8 +114,13 @@ func (ck *Clerk) Leave(gids []int) {
 func (ck *Clerk) Move(shard int, gid int) {
 	args := &MoveArgs{}
 	// Your code here.
+	ck.mu.Lock()
 	args.Shard = shard
 	args.GID = gid
+	args.ClientId = ck.clientId
+	args.RequestId = ck.currRequestId
+	ck.currRequestId++
+	ck.mu.Unlock()
 
 	for {
 		// try each known server.

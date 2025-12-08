@@ -25,14 +25,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 // STRUCTS
 //=====================================================================================================================================
 
-type Op struct {
-	Operation string
-	Key       string
-	Value     string
-	ClientId  int64
-	RequestId int64
-}
-
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -47,6 +39,14 @@ type KVServer struct {
 	resultCh      map[int]chan Op   // log index -> chan to notify waiting RPC handler
 
 	lastAppliedToDB int // last applied log index to the database
+}
+
+type Op struct {
+	Operation string
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int64
 }
 
 //=====================================================================================================================================
