@@ -73,7 +73,7 @@ type MoveArgs struct {
 	
 	ClientId int64
 	RequestId int64
-}
+} 
 
 type MoveReply struct {
 	WrongLeader bool
