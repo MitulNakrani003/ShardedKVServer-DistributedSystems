@@ -43,7 +43,6 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
-	// Your code here.
 	ck.mu.Lock()
 	args.Num = num
 	args.ClientId = ck.clientId
@@ -51,9 +50,7 @@ func (ck *Clerk) Query(num int) Config {
 	ck.currRequestId++
 	ck.mu.Unlock()
 
-	// Can save leaderID for shardmaster and use that to make RPC calls to server.
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardMaster.Query", args, &reply)
@@ -76,7 +73,6 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	ck.mu.Unlock()
 
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply JoinReply
 			ok := srv.Call("ShardMaster.Join", args, &reply)
@@ -90,7 +86,6 @@ func (ck *Clerk) Join(servers map[int][]string) {
 
 func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
-	// Your code here.
 	ck.mu.Lock()
 	args.GIDs = gids
 	args.ClientId = ck.clientId
@@ -99,7 +94,6 @@ func (ck *Clerk) Leave(gids []int) {
 	ck.mu.Unlock()
 
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply LeaveReply
 			ok := srv.Call("ShardMaster.Leave", args, &reply)
@@ -113,7 +107,6 @@ func (ck *Clerk) Leave(gids []int) {
 
 func (ck *Clerk) Move(shard int, gid int) {
 	args := &MoveArgs{}
-	// Your code here.
 	ck.mu.Lock()
 	args.Shard = shard
 	args.GID = gid
@@ -123,7 +116,6 @@ func (ck *Clerk) Move(shard int, gid int) {
 	ck.mu.Unlock()
 
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply MoveReply
 			ok := srv.Call("ShardMaster.Move", args, &reply)
