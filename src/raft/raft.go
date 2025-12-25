@@ -360,7 +360,7 @@ func (rf *Raft) replicateLogToPeer(server int) {
 	if rf.nextIndex[server] <= rf.lastIncludedIndex {
 		rf.mu.Unlock()
 		rf.sendSnapshotToPeer(server)
-		return
+		return	
 	}
 
 	// Building the Append Entries Arguments
