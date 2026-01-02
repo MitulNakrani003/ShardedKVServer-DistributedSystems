@@ -337,8 +337,8 @@ func (kv *ShardKV) DeleteShard(args *DeleteShardArgs, reply *DeleteShardReply) {
 	}
 
 	kv.mu.Lock()
-    delete(kv.resultCh, index)
-    kv.mu.Unlock()
+	delete(kv.resultCh, index)
+	kv.mu.Unlock()
 }
 
 //=====================================================================================================================================
@@ -431,6 +431,41 @@ func (kv *ShardKV) reconfigureOperation(newConfig shardmaster.Config) {
 }
 
 //=====================================================================================================================================
+// CONFIG POLLER ROUTINE
+//=====================================================================================================================================
+
+func (kv *ShardKV) pollConfig() {
+	for {
+		if kv.Killed() {
+			return
+		}
+		_, isLeader := kv.rf.GetState()
+
+		if isLeader { // only leaders can poll
+			kv.mu.Lock()
+			readyToUpdateConfig := true // can only update the config id all shards are serving
+			for _, status := range kv.shardStatus {
+				if status != Serving {
+					readyToUpdateConfig = false
+					break
+				}
+			}
+			currentConfigNum := kv.currentConfig.Num
+			kv.mu.Unlock()
+			if readyToUpdateConfig {
+				newConfig := kv.mck.Query(currentConfigNum + 1) // for linearizability, update config by sequence
+				isNewer := newConfig.Num > currentConfigNum
+				if isNewer {
+					kv.reconfigureOperation(newConfig)
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+//=====================================================================================================================================
 // APPLIER ROUTINE
 //=====================================================================================================================================
 
@@ -443,69 +478,60 @@ func (kv *ShardKV) applier() {
 		}
 
 		if msg.CommandValid {
-			op := msg.Command.(Op) // Cast the command to an Op struct
-
 			kv.mu.Lock()
 			if msg.CommandIndex <= kv.lastAppliedToDB {
 				kv.mu.Unlock()
-				continue // Skip already applied commands
+				continue
 			}
 
-			// Duplicate detection
-			lastRequestId, ok := kv.ackedRequests[op.ClientId]
-			if !ok || op.RequestId > lastRequestId { // If this is a new request or a higher request ID
+			op := msg.Command.(Op)
 
-				_, shardExists := kv.shardKVDatabase[op.Shard]
-				if !shardExists {
-					kv.shardKVDatabase[op.Shard] = make(map[string]string)
+			switch op.Operation {
+			case "Put", "Append":
+				lastRequestId, ok := kv.ackedRequests[op.ClientId]
+				if !ok || op.RequestId > lastRequestId {
+					if _, exists := kv.shardKVDatabase[op.Shard]; !exists {
+						kv.shardKVDatabase[op.Shard] = make(map[string]string)
+					}
+					if op.Operation == "Put" {
+						kv.shardKVDatabase[op.Shard][op.Key] = op.Value
+					} else {
+						kv.shardKVDatabase[op.Shard][op.Key] += op.Value
+					}
+					kv.ackedRequests[op.ClientId] = op.RequestId
 				}
-				switch op.Operation {
-				case "Put":
-					kv.shardKVDatabase[op.Shard][op.Key] = op.Value
-				case "Append":
-					kv.shardKVDatabase[op.Shard][op.Key] += op.Value
-				}
-				kv.ackedRequests[op.ClientId] = op.RequestId
-			}
-			if op.Operation == "Get" {
-				_, exists := kv.shardKVDatabase[op.Shard]
-				if !exists {
+
+			case "Get":
+				if _, exists := kv.shardKVDatabase[op.Shard]; !exists {
 					kv.shardKVDatabase[op.Shard] = make(map[string]string)
 				}
 				op.Value = kv.shardKVDatabase[op.Shard][op.Key]
-			}
-			if op.Operation == "Reconfigure" {
+
+			case "Reconfigure":
 				if kv.currentConfig.Num < op.Config.Num {
 					kv.shardStatus = make(map[int]string)
-
 					for shard, gid := range op.Config.Shards {
-						if gid == kv.gid {
+						isNewOwner := gid == kv.gid
+						isOldOwner := kv.currentConfig.Shards[shard] == kv.gid
+
+						if isNewOwner && isOldOwner {
+							kv.shardStatus[shard] = Serving
+						} else if isNewOwner && !isOldOwner {
 							kv.shardStatus[shard] = Pulling
+						} else if !isNewOwner && isOldOwner {
+							kv.shardStatus[shard] = Pushing
 						}
 					}
-
-					for shard, gid := range kv.currentConfig.Shards {
-						if gid == kv.gid {
-							_, ispresent := kv.shardStatus[shard]
-							if ispresent {
-								kv.shardStatus[shard] = Serving
-							} else {
-								kv.shardStatus[shard] = Pushing
-							}
-						}
-					}
-
 					kv.previousConfig = kv.currentConfig
 					kv.currentConfig = op.Config
 				}
-			}
-			if op.Operation == "InsertShard" {
+
+			case "InsertShard":
 				for cid, rid := range op.AckedRequests {
 					if currentRid, exists := kv.ackedRequests[cid]; !exists || rid > currentRid {
 						kv.ackedRequests[cid] = rid
 					}
 				}
-
 				for shard, kvs := range op.NewShardData {
 					if kv.shardStatus[shard] == Pulling {
 						kv.shardKVDatabase[shard] = make(map[string]string)
@@ -515,8 +541,8 @@ func (kv *ShardKV) applier() {
 						kv.shardStatus[shard] = Serving
 					}
 				}
-			}
-			if op.Operation == "DeleteShard" {
+
+			case "DeleteShard":
 				for _, shard := range op.ShardsToDelete {
 					if kv.shardStatus[shard] == Pushing {
 						delete(kv.shardKVDatabase, shard)
@@ -525,7 +551,6 @@ func (kv *ShardKV) applier() {
 				}
 			}
 
-			// Update last applied index
 			kv.lastAppliedToDB = msg.CommandIndex
 
 			ch, ok := kv.resultCh[msg.CommandIndex]
@@ -583,41 +608,6 @@ func (kv *ShardKV) readSnapshot(snapshot []byte) {
 		kv.currentConfig = config
 		kv.previousConfig = prevconfig
 		kv.shardStatus = shardstatus
-	}
-}
-
-//=====================================================================================================================================
-// CONFIG POLLER ROUTINE
-//=====================================================================================================================================
-
-func (kv *ShardKV) pollConfig() {
-	for {
-		if kv.Killed() {
-			return
-		}
-		_, isLeader := kv.rf.GetState()
-
-		if isLeader { // only leaders can poll
-			kv.mu.Lock()
-			readyToUpdateConfig := true // can only update the config id all shards are serving
-			for _, status := range kv.shardStatus {
-				if status != Serving {
-					readyToUpdateConfig = false
-					break
-				}
-			}
-			currentConfigNum := kv.currentConfig.Num
-			kv.mu.Unlock()
-			if readyToUpdateConfig {
-				newConfig := kv.mck.Query(currentConfigNum + 1) // for linearizability, update config by sequence
-				isNewer := newConfig.Num > currentConfigNum
-				if isNewer {
-					kv.reconfigureOperation(newConfig)
-				}
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
