@@ -19,16 +19,22 @@ import (
 //=====================================================================================================================================
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
 	Operation string
 	Key       string
 	Value     string
 	ClientId  int64
 	RequestId int64
 
-	Shard int // For shard migration
+	// for reconfiguration
+	Shard  int
+	Config shardmaster.Config
+
+	// for insert and garbage collection
+	NewShardData  map[int]map[string]string
+	AckedRequests map[int64]int64
+
+	// for delete shard
+	ShardsToDelete []int
 }
 
 type ShardKV struct {
@@ -40,14 +46,16 @@ type ShardKV struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	make_end      func(string) *labrpc.ClientEnd
-	gid           int
-	masters       []*labrpc.ClientEnd
-	mck           *shardmaster.Clerk
-	currentConfig shardmaster.Config
+	make_end       func(string) *labrpc.ClientEnd
+	gid            int
+	masters        []*labrpc.ClientEnd
+	mck            *shardmaster.Clerk // ShardMaster Clerk
+	previousConfig shardmaster.Config // Just Previous config of the Updated config
+	currentConfig  shardmaster.Config // Current Latest Config from ShardMaster
 
-	shardKVDatabase map[int]map[string]string // shard - > shard key values
+	shardKVDatabase map[int]map[string]string // Shard -> Shard key values
 	ackedRequests   map[int64]int64           // clientId -> lastRequestId
+	shardStatus     map[int]string            // Shard -> Shard Status
 
 	resultCh map[int]chan Op // log index -> chan to notify waiting RPC handler
 
@@ -67,14 +75,26 @@ func (kv *ShardKV) ShardMatchesGID(shard int) bool {
 	return true
 }
 
+func (kv *ShardKV) isShardServing(shard int) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	status, ok := kv.shardStatus[shard]
+	return ok && status == Serving
+}
+
 //=====================================================================================================================================
-// GET AND PUTAPPEND HANDLER
+// GET AND PUTAPPEND RPC
 //=====================================================================================================================================
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	requestShard := key2shard(args.Key)
 	if !kv.ShardMatchesGID(requestShard) {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	if !kv.isShardServing(requestShard) {
 		reply.Err = ErrWrongGroup
 		return
 	}
@@ -125,6 +145,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
+	if !kv.isShardServing(requestShard) {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
 	op := Op{
 		Operation: args.Op,
 		Key:       args.Key,
@@ -161,6 +186,248 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	delete(kv.resultCh, index)
 	kv.mu.Unlock()
+}
+
+//=====================================================================================================================================
+// PULL SHARD RPC
+//=====================================================================================================================================
+
+func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if args.ConfigNum >= kv.currentConfig.Num {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	reply.Err = OK
+	reply.sharedShards = make(map[int]map[string]string)
+	reply.ackedRequests = make(map[int64]int64)
+
+	for _, shard := range args.ShardIDs {
+		if kv.shardStatus[shard] == Pushing {
+			// deep copy database
+			reply.sharedShards[shard] = make(map[string]string)
+			for k, v := range kv.shardKVDatabase[shard] {
+				reply.sharedShards[shard][k] = v
+			}
+		}
+	}
+
+	for clientId, requestId := range kv.ackedRequests {
+		reply.ackedRequests[clientId] = requestId
+	}
+
+}
+
+//=====================================================================================================================================
+// INSERT OPERATION HANDLER
+//=====================================================================================================================================
+
+func (kv *ShardKV) insertShardOperation(reply *PullShardReply) bool {
+	op := Op{
+		Operation:     "InsertShard",
+		NewShardData:  reply.sharedShards,
+		AckedRequests: reply.ackedRequests,
+	}
+
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false
+	}
+
+	kv.mu.Lock()
+	ch := make(chan Op, 1)
+	kv.resultCh[index] = ch
+	kv.mu.Unlock()
+
+	success := false
+	select {
+	case <-ch:
+		success = true
+	case <-time.After(500 * time.Millisecond):
+		//timeout
+	}
+
+	kv.mu.Lock()
+	delete(kv.resultCh, index)
+	kv.mu.Unlock()
+
+	return success
+}
+
+func (kv *ShardKV) sendPullShardRequests(wg *sync.WaitGroup, args *PullShardArgs, serversToSend []string) {
+	defer wg.Done()
+	for {
+		if kv.Killed() {
+			return
+		}
+
+		for si := 0; si < len(serversToSend); si++ {
+			srv := kv.make_end(serversToSend[si])
+			var reply PullShardReply
+			ok := srv.Call("ShardKV.PullShard", args, &reply)
+
+			if ok && reply.Err == OK {
+				if kv.insertShardOperation(&reply) {
+					// goroutines for delete shard operaation
+					go kv.sendDeleteShardRequests(args.ConfigNum, args.ShardIDs, serversToSend)
+					return
+				}
+				return
+			}
+
+			if ok && reply.Err == ErrWrongGroup {
+				break
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+//=====================================================================================================================================
+// DELETE SHARD RPC
+//=====================================================================================================================================
+
+func (kv *ShardKV) DeleteShard(args *DeleteShardArgs, reply *DeleteShardReply) {
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if args.ConfigNum >= kv.currentConfig.Num {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		Operation:      "DeleteShard",
+		ShardsToDelete: args.ShardIDs,
+	}
+
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	ch := make(chan Op, 1)
+	kv.resultCh[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case <-ch:
+		reply.Err = OK
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+    delete(kv.resultCh, index)
+    kv.mu.Unlock()
+}
+
+//=====================================================================================================================================
+// DELETE SHARD OPERATION HANDLER
+//=====================================================================================================================================
+
+func (kv *ShardKV) sendDeleteShardRequests(confignNum int, shardIds []int, serversToSend []string) {
+	for {
+		if kv.Killed() {
+			return
+		}
+
+		for si := 0; si < len(serversToSend); si++ {
+			args := DeleteShardArgs{
+				ConfigNum: confignNum,
+				ShardIDs:  shardIds,
+			}
+			srv := kv.make_end(serversToSend[si])
+			var reply DeleteShardReply
+			ok := srv.Call("ShardKV.DeleteShard", &args, &reply)
+
+			if ok && reply.Err == OK {
+				return
+			}
+
+			if ok && reply.Err == ErrWrongGroup {
+				break
+			}
+
+		}
+	}
+}
+
+//=====================================================================================================================================
+// RECONFIGURE OPERATION HANDLER
+//=====================================================================================================================================
+
+func (kv *ShardKV) reconfigureOperation(newConfig shardmaster.Config) {
+
+	op := Op{
+		Operation: "Reconfigure",
+		Config:    newConfig,
+	}
+
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		return
+	}
+
+	ch := make(chan Op, 1)
+	kv.resultCh[index] = ch
+
+	select {
+	case <-ch:
+		shardsToPull := make(map[int][]int) // gid -> shards to get from that gid
+		kv.mu.Lock()
+		for shard, status := range kv.shardStatus {
+			if status == Pulling {
+				previousOwnerGid := kv.previousConfig.Shards[shard]
+				if previousOwnerGid == 0 {
+					kv.shardStatus[shard] = Serving
+				} else {
+					shardsToPull[previousOwnerGid] = append(shardsToPull[previousOwnerGid], shard)
+				}
+
+			}
+		}
+
+		var wg sync.WaitGroup
+		for gid, shardsArr := range shardsToPull {
+			args := PullShardArgs{
+				ConfigNum: kv.currentConfig.Num - 1,
+				ShardIDs:  shardsArr,
+			}
+			wg.Add(1)
+			go kv.sendPullShardRequests(&wg, &args, kv.previousConfig.Groups[gid])
+		}
+		kv.mu.Unlock()
+		wg.Wait()
+
+	case <-time.After(500 * time.Millisecond):
+		// timeout
+	}
+
+	kv.mu.Lock()
+	delete(kv.resultCh, index)
+	kv.mu.Unlock()
+
 }
 
 //=====================================================================================================================================
@@ -207,6 +474,56 @@ func (kv *ShardKV) applier() {
 				}
 				op.Value = kv.shardKVDatabase[op.Shard][op.Key]
 			}
+			if op.Operation == "Reconfigure" {
+				if kv.currentConfig.Num < op.Config.Num {
+					kv.shardStatus = make(map[int]string)
+
+					for shard, gid := range op.Config.Shards {
+						if gid == kv.gid {
+							kv.shardStatus[shard] = Pulling
+						}
+					}
+
+					for shard, gid := range kv.currentConfig.Shards {
+						if gid == kv.gid {
+							_, ispresent := kv.shardStatus[shard]
+							if ispresent {
+								kv.shardStatus[shard] = Serving
+							} else {
+								kv.shardStatus[shard] = Pushing
+							}
+						}
+					}
+
+					kv.previousConfig = kv.currentConfig
+					kv.currentConfig = op.Config
+				}
+			}
+			if op.Operation == "InsertShard" {
+				for cid, rid := range op.AckedRequests {
+					if currentRid, exists := kv.ackedRequests[cid]; !exists || rid > currentRid {
+						kv.ackedRequests[cid] = rid
+					}
+				}
+
+				for shard, kvs := range op.NewShardData {
+					if kv.shardStatus[shard] == Pulling {
+						kv.shardKVDatabase[shard] = make(map[string]string)
+						for k, v := range kvs {
+							kv.shardKVDatabase[shard][k] = v
+						}
+						kv.shardStatus[shard] = Serving
+					}
+				}
+			}
+			if op.Operation == "DeleteShard" {
+				for _, shard := range op.ShardsToDelete {
+					if kv.shardStatus[shard] == Pushing {
+						delete(kv.shardKVDatabase, shard)
+						delete(kv.shardStatus, shard)
+					}
+				}
+			}
 
 			// Update last applied index
 			kv.lastAppliedToDB = msg.CommandIndex
@@ -238,6 +555,8 @@ func (kv *ShardKV) checkAndTakeSnapshot() {
 		e.Encode(kv.shardKVDatabase)
 		e.Encode(kv.ackedRequests)
 		e.Encode(kv.currentConfig)
+		e.Encode(kv.previousConfig)
+		e.Encode(kv.shardStatus)
 		data := w.Bytes()
 		kv.rf.SaveSnapshot(kv.lastAppliedToDB, data)
 	}
@@ -253,13 +572,17 @@ func (kv *ShardKV) readSnapshot(snapshot []byte) {
 	var db map[int]map[string]string
 	var ack map[int64]int64
 	var config shardmaster.Config
+	var prevconfig shardmaster.Config
+	var shardstatus map[int]string
 
-	if d.Decode(&db) != nil || d.Decode(&ack) != nil || d.Decode(&config) != nil {
+	if d.Decode(&db) != nil || d.Decode(&ack) != nil || d.Decode(&config) != nil || d.Decode(&prevconfig) != nil || d.Decode(&shardstatus) != nil {
 		log.Fatalf("ShardKV %d failed to read snapshot", kv.me)
 	} else {
 		kv.shardKVDatabase = db
 		kv.ackedRequests = ack
 		kv.currentConfig = config
+		kv.previousConfig = prevconfig
+		kv.shardStatus = shardstatus
 	}
 }
 
@@ -272,12 +595,28 @@ func (kv *ShardKV) pollConfig() {
 		if kv.Killed() {
 			return
 		}
-		newConfig := kv.mck.Query(-1)
-		kv.mu.Lock()
-		if newConfig.Num > kv.currentConfig.Num {
-			kv.currentConfig = newConfig
+		_, isLeader := kv.rf.GetState()
+
+		if isLeader { // only leaders can poll
+			kv.mu.Lock()
+			readyToUpdateConfig := true // can only update the config id all shards are serving
+			for _, status := range kv.shardStatus {
+				if status != Serving {
+					readyToUpdateConfig = false
+					break
+				}
+			}
+			currentConfigNum := kv.currentConfig.Num
+			kv.mu.Unlock()
+			if readyToUpdateConfig {
+				newConfig := kv.mck.Query(currentConfigNum + 1) // for linearizability, update config by sequence
+				isNewer := newConfig.Num > currentConfigNum
+				if isNewer {
+					kv.reconfigureOperation(newConfig)
+				}
+			}
 		}
-		kv.mu.Unlock()
+
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -333,7 +672,7 @@ func StartServer(
 	maxraftstate int, gid int,
 	masters []*labrpc.ClientEnd,
 	make_end func(string) *labrpc.ClientEnd) *ShardKV {
-	
+
 	labgob.Register(Op{})
 
 	kv := new(ShardKV)
@@ -346,6 +685,8 @@ func StartServer(
 	kv.masters = masters
 
 	kv.mck = shardmaster.MakeClerk(kv.masters)
+	kv.currentConfig = kv.mck.Query(0)
+	kv.previousConfig = kv.mck.Query(0)
 
 	kv.shardKVDatabase = make(map[int]map[string]string)
 	kv.ackedRequests = make(map[int64]int64)
