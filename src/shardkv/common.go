@@ -56,8 +56,8 @@ type PullShardArgs struct {
 
 type PullShardReply struct {
 	Err           Err
-	sharedShards  map[int]map[string]string
-	ackedRequests map[int64]int64
+	SharedShards  map[int]map[string]string
+	AckedRequests map[int64]int64
 }
 
 type DeleteShardArgs struct {

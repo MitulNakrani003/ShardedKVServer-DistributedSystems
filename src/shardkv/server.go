@@ -208,21 +208,21 @@ func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
 	}
 
 	reply.Err = OK
-	reply.sharedShards = make(map[int]map[string]string)
-	reply.ackedRequests = make(map[int64]int64)
+	reply.SharedShards = make(map[int]map[string]string)
+	reply.AckedRequests = make(map[int64]int64)
 
 	for _, shard := range args.ShardIDs {
 		if kv.shardStatus[shard] == Pushing {
 			// deep copy database
-			reply.sharedShards[shard] = make(map[string]string)
+			reply.SharedShards[shard] = make(map[string]string)
 			for k, v := range kv.shardKVDatabase[shard] {
-				reply.sharedShards[shard][k] = v
+				reply.SharedShards[shard][k] = v
 			}
 		}
 	}
 
 	for clientId, requestId := range kv.ackedRequests {
-		reply.ackedRequests[clientId] = requestId
+		reply.AckedRequests[clientId] = requestId
 	}
 
 }
@@ -234,8 +234,8 @@ func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
 func (kv *ShardKV) insertShardOperation(reply *PullShardReply) bool {
 	op := Op{
 		Operation:     "InsertShard",
-		NewShardData:  reply.sharedShards,
-		AckedRequests: reply.ackedRequests,
+		NewShardData:  reply.SharedShards,
+		AckedRequests: reply.AckedRequests,
 	}
 
 	index, _, isLeader := kv.rf.Start(op)
