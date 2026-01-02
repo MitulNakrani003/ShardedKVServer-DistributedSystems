@@ -389,11 +389,14 @@ func (kv *ShardKV) reconfigureOperation(newConfig shardmaster.Config) {
 		return
 	}
 
+	kv.mu.Lock()
 	ch := make(chan Op, 1)
 	kv.resultCh[index] = ch
+	kv.mu.Unlock()
 
 	select {
 	case <-ch:
+		// create shard pull requests arrays for arguments
 		shardsToPull := make(map[int][]int) // gid -> shards to get from that gid
 		kv.mu.Lock()
 		for shard, status := range kv.shardStatus {
@@ -404,7 +407,6 @@ func (kv *ShardKV) reconfigureOperation(newConfig shardmaster.Config) {
 				} else {
 					shardsToPull[previousOwnerGid] = append(shardsToPull[previousOwnerGid], shard)
 				}
-
 			}
 		}
 
@@ -507,13 +509,13 @@ func (kv *ShardKV) applier() {
 				op.Value = kv.shardKVDatabase[op.Shard][op.Key]
 
 			case "Reconfigure":
-				if kv.currentConfig.Num < op.Config.Num {
+				if kv.currentConfig.Num < op.Config.Num { // checks to avoid stale reconfiguration
 					kv.shardStatus = make(map[int]string)
 					for shard, gid := range op.Config.Shards {
 						isNewOwner := gid == kv.gid
 						isOldOwner := kv.currentConfig.Shards[shard] == kv.gid
 
-						if isNewOwner && isOldOwner {
+						if isNewOwner && isOldOwner { // shard remains with the same group
 							kv.shardStatus[shard] = Serving
 						} else if isNewOwner && !isOldOwner {
 							kv.shardStatus[shard] = Pulling
