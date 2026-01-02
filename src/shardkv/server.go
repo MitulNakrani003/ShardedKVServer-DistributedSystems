@@ -367,8 +367,8 @@ func (kv *ShardKV) sendDeleteShardRequests(confignNum int, shardIds []int, serve
 			if ok && reply.Err == ErrWrongGroup {
 				break
 			}
-
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -460,7 +460,6 @@ func (kv *ShardKV) pollConfig() {
 				}
 			}
 		}
-
 		time.Sleep(100 * time.Millisecond)
 	}
 }
