@@ -14,6 +14,7 @@ const (
 	ErrNoKey          = "ErrNoKey"
 	ErrWrongGroup     = "ErrWrongGroup"
 	ErrWrongLeader    = "ErrWrongLeader"
+
 	Serving           = "Serving"
 	Pulling           = "Pulling"
 	Pushing           = "Pushing"
@@ -24,7 +25,6 @@ type Err string
 
 // Put or Append
 type PutAppendArgs struct {
-	// You'll have to add definitions here.
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
@@ -58,6 +58,7 @@ type PullShardReply struct {
 	Err           Err
 	SharedShards  map[int]map[string]string
 	AckedRequests map[int64]int64
+	ConfigNum     int
 }
 
 type DeleteShardArgs struct {
