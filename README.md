@@ -224,6 +224,6 @@ This project is for educational purposes as part of MIT's 6.824 course.
 
 ## ⭐ Acknowledgments
 
-* MIT 6.824 Distributed Systems Course Staff
+* MIT 6.824 Distributed Systems Course 
 * The Raft paper authors (Diego Ongaro and John Ousterhout)
 * The MapReduce paper authors (Jeffrey Dean and Sanjay Ghemawat)
