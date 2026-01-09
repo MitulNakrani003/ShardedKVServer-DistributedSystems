@@ -141,35 +141,6 @@ Each lab progressively deepens understanding of building **fault-tolerant, paral
 └───────────────┘ └───────────────┘ └───────────────┘
 ```
 
-### 🔧 Part 4A: Shard Controller
-
-The shard controller manages cluster configurations and shard assignments:
-
-* **Join RPC:** Add new replica groups and rebalance shards evenly
-* **Leave RPC:** Remove replica groups and redistribute their shards
-* **Move RPC:** Hand-off specific shard to a designated group
-* **Query RPC:** Retrieve configuration by number (or latest with -1)
-
-**Rebalancing Algorithm:**
-* Shards distributed as evenly as possible across groups
-* Minimal shard movement during Join/Leave operations
-* Deterministic rebalancing (consistent across all controllers)
-
-### 🔧 Part 4B: Sharded KV Server
-
-Each ShardKV server operates within a replica group, handling:
-
-* **Client Operations:** Get/Put/Append for keys in owned shards
-* **Configuration Detection:** Periodic polling for configuration changes
-* **Shard Migration:** Pull shards from other groups during reconfiguration
-* **Shard Cleanup:** Delete migrated data after successful handoff
-
-**Key Implementation Details:**
-* **ErrWrongGroup:** Returned when server doesn't own the requested shard
-* **Sequential configuration processing:** Configurations applied one at a time, in order
-* **Shard state machine:** Track shard status (Serving, Pulling, BePulling, GCing)
-* **Cross-group RPC:** PullShard and DeleteShard for data migration
-
 ### 💡 Key Learnings
 
 * Designed **horizontally scalable distributed storage** with dynamic sharding
